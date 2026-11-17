@@ -126,10 +126,15 @@ def require_current():
     rec = current()
     if not rec:
         raise Conflict("no recovered replica is currently served; start a recovery first")
-    if not _replica_running(rec["work_dir"]):
+    if not replica_alive(rec["work_dir"]):
         _fail_current("replica postgres is not running anymore")
         raise Conflict("the recovered replica exited; its recovery has been marked failed")
     return rec
+
+
+def replica_alive(work_dir) -> bool:
+    """Whether the replica postmaster for a work directory is still up."""
+    return _replica_running(work_dir)
 
 
 def monitor_current():

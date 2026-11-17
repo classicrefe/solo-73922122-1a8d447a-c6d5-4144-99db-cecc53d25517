@@ -82,4 +82,36 @@ say "9. assertions"
 [ "$primary_total" = "36" ] || fail "primary should hold 36 rows (30 left + 6 new), got $primary_total"
 [ "$primary_ixb"  = "6"  ] || fail "primary should hold 6 IXB rows, got $primary_ixb"
 
-printf '\n\033[32mDEMO OK: deleted rows recovered on the isolated replica; the primary kept collecting.\033[0m\n'
+say "10. backfill order: snapshot the deleted rows for one intersection from the replica"
+# wide UTC half-open window covering the whole demo dataset (only IX-1 rows match)
+order=$(curl -fsS -X POST "$BASE/backfill/orders" -H 'Content-Type: application/json' -d "{
+  \"recovery_id\": $rid,
+  \"intersection_id\": \"IX-1\",
+  \"minute_start\": \"$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)\",
+  \"minute_end\": \"$(date -u -d '2 hours'     +%Y-%m-%dT%H:%M:%SZ)\"
+}")
+echo "$order" | jq '{id, source_task, intersection_id, status, row_count}'
+oid=$(echo "$order" | jq -r .id)
+[ "$(echo "$order" | jq -r .row_count)" = "20" ] || fail "order should snapshot 20 replica rows"
+# the full snapshot is stored on the primary for later verification
+curl -fsS "$BASE/backfill/orders/$oid/rows" | jq '{row_count, sample: .rows[0:2]}'
+
+say "11. confirm the backfill: missing rows inserted, equal rows skipped"
+receipt=$(curl -fsS -X POST "$BASE/backfill/orders/$oid/confirm")
+echo "$receipt" | jq '{order_id, source_task, status, backfilled_rows, skipped_rows, already_confirmed}'
+[ "$(echo "$receipt" | jq -r .backfilled_rows)" = "10" ] || fail "10 deleted rows should be backfilled"
+[ "$(echo "$receipt" | jq -r .skipped_rows)" = "10" ] || fail "10 existing equal rows should be skipped"
+[ "$(echo "$receipt" | jq -r .source_task)" = "$POINT" ] || fail "receipt must carry the source task name"
+
+say "12. exactly-once: re-confirm returns the original receipt, no second apply"
+again=$(curl -fsS -X POST "$BASE/backfill/orders/$oid/confirm")
+echo "$again" | jq '{status, backfilled_rows, already_confirmed}'
+[ "$(echo "$again" | jq -r .already_confirmed)" = "true" ] || fail "retry must be idempotent"
+
+say "13. the primary now holds the restored rows (and kept collecting all along)"
+curl -fsS "$BASE/primary/traffic?intersection_id=IX-1&limit=100" \
+  | jq '{ix1_rows: .total_rows}'
+final_total=$(curl -fsS "$BASE/primary/traffic?limit=1000" | jq .total_rows)
+[ "$final_total" = "46" ] || fail "primary should now hold 46 rows (36 + 10 backfilled), got $final_total"
+
+printf '\n\033[32mDEMO OK: deleted rows recovered on the isolated replica and back-filled to the primary exactly once.\033[0m\n'

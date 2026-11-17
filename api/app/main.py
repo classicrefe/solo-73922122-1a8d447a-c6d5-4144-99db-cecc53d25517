@@ -16,13 +16,15 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
+import psycopg
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
-from . import backup, config, db, lsn, recovery, state
+from . import backfill, backup, config, db, lsn, recovery, state
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -56,6 +58,8 @@ async def lifespan(_app):
     os.makedirs(os.path.dirname(config.STATE_DB), exist_ok=True)
     state.init()
     recovery.cleanup_on_startup()
+    # independent management tables for backfill orders live on the primary
+    backfill.ensure_schema()
     # physical base backup is established at startup, in the background
     threading.Thread(target=backup.run_base_backup, daemon=True, name="base-backup").start()
     threading.Thread(target=_readiness_loop, daemon=True, name="readiness").start()
@@ -238,6 +242,94 @@ def replica_traffic(
         "total_rows": total,
         "rows": rows,
     }
+
+
+# --------------------------------------------------------------------------
+# backfill orders (补数): snapshot a successful recovery's replica, then
+# confirm the missing rows into the still-collecting primary
+# --------------------------------------------------------------------------
+
+class BackfillOrderRequest(BaseModel):
+    recovery_id: int = Field(..., description="成功恢复任务号 (successful recovery task id)")
+    intersection_id: str = Field(..., min_length=1, max_length=200, description="单个路口")
+    minute_start: datetime = Field(
+        ..., description="UTC 分钟区间起点（含，left-closed）；无时区按 UTC 处理"
+    )
+    minute_end: datetime = Field(
+        ..., description="UTC 分钟区间终点（不含，right-open）；无时区按 UTC 处理"
+    )
+
+
+@app.post("/backfill/orders", status_code=201, tags=["backfill"])
+def create_backfill_order(req: BackfillOrderRequest):
+    """制单：按成功恢复任务号、单个路口及 UTC 左闭右开分钟区间生成补数单。
+
+    成功时把该副本在区间内的**完整记录**快照存入主库 backfill 管理表供核对；
+    区间记录超过 1000 条直接拒绝。取源时若副本已切换/不可用，则只能取得
+    原点完整记录或拒绝（绝不混用不同副本的数据）。
+    """
+    try:
+        return backfill.create_order(
+            req.recovery_id, req.intersection_id,
+            req.minute_start, req.minute_end,
+        )
+    except backfill.NotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except backfill.Conflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except backfill.Rejected as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/backfill/orders/{order_id}/confirm", tags=["backfill"])
+def confirm_backfill_order(order_id: int):
+    """确认补数：只补缺行，同值跳过；任一同键异值则整单拒绝并列出冲突。
+
+    补入与回执在同一事务提交（失败不留部分补入）。同单并发、断连或重启后
+    重试只应用一次并返回原回执；即使后来记录被删也不会重补。
+    """
+    try:
+        return backfill.confirm_order(order_id)
+    except backfill.NotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except backfill.Conflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except psycopg.errors.LockNotAvailable as exc:
+        raise HTTPException(
+            409, "the order is being confirmed by another request; retry shortly"
+        ) from exc
+    except psycopg.errors.QueryCanceled as exc:
+        raise HTTPException(
+            503, f"backfill confirmation timed out and was rolled back: {exc}"
+        ) from exc
+
+
+@app.get("/backfill/orders", tags=["backfill"])
+def list_backfill_orders(limit: int = Query(100, ge=1, le=1000)):
+    """补数单列表（含状态与回执字段）。"""
+    return {"items": backfill.list_orders(limit)}
+
+
+@app.get("/backfill/orders/{order_id}", tags=["backfill"])
+def get_backfill_order(order_id: int):
+    """查补数单/回执：来源任务号、补入与跳过数量等。"""
+    try:
+        return backfill.get_order(order_id)
+    except backfill.NotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/backfill/orders/{order_id}/rows", tags=["backfill"])
+def get_backfill_order_rows(order_id: int):
+    """核对用：制单时保存的该副本完整快照记录。"""
+    order = backfill.get_order(order_id)  # 404 if missing
+    with db.primary(row_factory=dict_row) as conn:
+        rows = conn.execute(
+            "SELECT intersection_id, minute_utc, vehicle_count "
+            "FROM backfill.order_rows WHERE order_id = %s ORDER BY minute_utc",
+            (order_id,),
+        ).fetchall()
+    return {"order_id": order_id, "row_count": len(rows), "rows": rows}
 
 
 # --------------------------------------------------------------------------

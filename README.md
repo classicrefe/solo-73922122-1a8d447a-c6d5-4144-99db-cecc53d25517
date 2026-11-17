@@ -6,6 +6,11 @@
 后才允许选择它恢复；每次恢复都从基准备份**重建一个全新的隔离只读副本**，重放 WAL 到
 目标恢复点即停，供查询补数。
 
+找到被删记录后，值班员通过**补数 API**把数据补回仍在采集的主库：按成功恢复任务号、
+单个路口与 UTC 左闭右开分钟区间**制单**（副本完整记录快照存主库独立管理表供核对，
+超过 1000 条拒绝），再**确认**——只补缺行、同值跳过、任一同键异值整单拒绝并列出
+冲突；补入与回执同事务提交，同单并发/断连/重启重试只应用一次并返回原回执。
+
 ## 架构
 
 ```
@@ -25,13 +30,14 @@
 ```
 
 - **db**：`postgres:16`，开启 `archive_mode=on`、`archive_timeout=10s`，WAL 归档到共享卷。
-  源库只有一张业务表 `traffic_minute_counts(intersection_id, minute_utc, vehicle_count)`。
+  源库只有一张业务表 `traffic_minute_counts(intersection_id, minute_utc, vehicle_count)`；
+  补数功能在主库另建**独立 `backfill` 管理 schema**存放补数单与快照（业务表不变）。
 - **api**：`postgres:16` 镜像 + FastAPI。启动时执行 `pg_basebackup -X stream` 建立物理
   基准备份；恢复时把基准备份复制到全新目录，配置 `restore_command` +
   `recovery_target_name` + `recovery_target_action=pause`，以热备只读方式启动在
   独立端口（容器内 127.0.0.1:55433）。
-- API 自身的台账（恢复点、恢复任务）存在独立 SQLite（api_state 卷），**不污染源库**，
-  源库始终只有一张业务表。
+- API 自身的恢复台账（恢复点、恢复任务）存在独立 SQLite（api_state 卷），**不污染源库**；
+  源库 `public` 始终只有一张业务表，补数台账放在独立的 `backfill` schema。
 
 ## 快速开始
 
@@ -63,6 +69,10 @@ docker compose up --build
 | GET | `/recoveries` / `/recoveries/{id}` | 恢复任务状态：running/success/failed/superseded + 错误详情 |
 | GET | `/recoveries/current` | 当前对外服务的恢复（无则 404） |
 | GET | `/replica/traffic` | 查询已恢复只读副本（未就绪/已失败返回 409） |
+| POST | `/backfill/orders` | 制单：成功恢复任务号 + 单路口 + UTC 左闭右开分钟区间；快照存主库，>1000 行 422，副本已切换 409 |
+| POST | `/backfill/orders/{id}/confirm` | 确认补数：补缺行/跳同值/同键异值整单 409 并列冲突；幂等，返回回执 |
+| GET | `/backfill/orders` / `/backfill/orders/{id}` | 补数单列表/详情（状态、来源任务号、补入与跳过数量、冲突明细） |
+| GET | `/backfill/orders/{id}/rows` | 制单时保存的副本完整快照记录（核对用） |
 
 ## 恢复语义（对照需求）
 
@@ -83,6 +93,32 @@ docker compose up --build
 - **不混数据**：新恢复启动即退役（停止+删除）旧副本并清空服务指针；每次恢复都是
   基准备份的全新拷贝，先后两个恢复点互不干扰。
 - **主库不阻塞**：恢复只读归档卷与基准备份，对主库零写入、零锁。
+
+## 补数语义（对照需求）
+
+补数台账保存在主库**独立 `backfill` 管理 schema**（`backfill.orders` /
+`backfill.order_rows`），业务表 `traffic_minute_counts` 与物理恢复机制保持不变。
+
+- **制单（POST /backfill/orders）**：入参为成功恢复任务号、单个路口、UTC 左闭右开
+  分钟区间。服务校验该任务正是当前对外服务的成功副本（前后各检查一次身份与存活，
+  读中发生副本切换/退出则 409 拒绝，绝不混用不同副本数据），把区间内**完整记录**
+  原样快照写入管理表；区间记录 **>1000 条直接 422 拒绝**（`OFFSET 1000 LIMIT 1`
+  探测，不依赖先拉全量）。
+- **确认（POST /backfill/orders/{id}/confirm）**：单事务执行——
+  - 先 `SELECT ... FOR UPDATE` 锁定补数单行（同单并发在此排队，保证只应用一次），
+    再只锁该路口区间内的业务行，**无关路口全程可写**；
+  - 缺行插入；同键同值跳过；**任一同键异值 → 整单回滚、零写入，409 并列出冲突明细**
+    （快照值 vs 主库现值），单据置 `failed`；
+  - 与采集/直连 SQL 更正交错时不覆盖新值（锁 + `ON CONFLICT DO NOTHING` + 提交前
+    复读校验，发现异值即回滚整单）；
+  - 补入与回执在**同一事务提交**，失败不留任何部分补入。
+- **恰好一次**：成功后单据为 `succeeded`；同单并发、提交后断连或进程重启后的重试
+  都直接返回**原回执**（`already_confirmed=true`），不再触碰业务表——即使后来记录
+  被删也不会重补。回执含来源任务号（恢复点名）、补入数、跳过数。
+- **副本退役不影响确认**：制单后快照已在主库，确认只依赖管理表，源副本被新恢复
+  退役/删除后仍可确认、查重试。
+- **韧性**：确认事务设置 `lock_timeout=10s`、`statement_timeout=60s`、
+  `idle_in_transaction_session_timeout=30s`，卡住即失败回滚而非无限挂起。
 
 ## 环境变量（api 服务）
 
@@ -122,9 +158,32 @@ PMSIGNAL）。这两点在正常 Linux / Docker 中不存在，属沙箱特有�
 - ✅ API 重启清理：遗留 running/success 任务置 failed、目录删除、指针清空
 - ✅ LSN/WAL 段名计算单元测试、compose YAML、demo.sh 语法、OpenAPI 生成
 
+### 补数 API（本次新增，真实 PostgreSQL 端到端 47 项断言全过）
+
+在本沙箱用 Debian 官方 PostgreSQL 15.18 二进制（免 root 解包）起**双真实集群**
+（归档主库 55502/55503 + 隔离副本），API 真实连库跑通（沙箱无 docker，
+`BACKUP_ON_STARTUP=0` 跳过基准备份；补数逻辑不依赖该备份）：
+
+- ✅ 制单：成功任务+单路口+UTC 左闭右开区间，副本完整快照（20 行、值 100..119）
+  原样落入主库 `backfill` schema，`/backfill/orders/{id}/rows` 可核对
+- ✅ >1000 条 → 422 拒绝；区间反向 → 422；任务号不存在 → 404；非成功/非当前副本 → 409
+- ✅ 确认：缺 10 行补入、同值 10 行跳过，业务表恰好 +10；回执含来源任务号与两计数
+- ✅ 同键异值 → 整单 409、零部分写入、冲突明细落库、单据 `failed` 且不可再确认
+- ✅ 与采集/直连 SQL 交错更新（777/888）不被覆盖，冲突整单回滚
+- ✅ 只锁本路口区间行，无关路口（OTHER-IX / IXB）并发写入照常成功
+- ✅ 补入与回执同事务：构造冲突时 IX-2 行数保持 11 不变（无部分补入）
+- ✅ **恰好一次**：8 并发确认同单 → 全部 200，仅 1 单真实补入、其余返回原回执
+  （`already_confirmed`）；确认后删行再确认不重补
+- ✅ **重启重试**：另起 API 进程（新 sqlite、同一主库）确认旧单 → 返回原回执、
+  不重补已删行；重启后仍可制新单（副本快照链路正常）
+- ✅ 副本切换/退役：制单前切换 → 409；制单后退役副本 → 旧单确认/查询不受影响
+- ✅ 管理表独立：`public` 仍只有 `traffic_minute_counts`，台账在 `backfill` schema
+- ✅ `/docs` Swagger 可制单、确认、查回执、查快照、查主库数据（全部 200）
+
 未能在本环境验证（沙箱信号限制所致，逻辑已在 docker 场景设计并走查）：
 
-- ⚠️ `docker compose up` 整体构建与联调（沙箱无 docker）
+- ⚠️ `docker compose up` 整体构建与联调（沙箱无 docker；compose/Dockerfile 已做
+  YAML 与语法校验，新增能力无需改动 compose——管理表由 API 启动时自动建在主库）
 - ⚠️ `pg_basebackup` 成功路径（沙箱禁止 checkpoint 信号；失败路径已验证）
 - ⚠️ 热备副本接受连接后的 API 成功闭环（`status=success` 与 `/replica/traffic` 200）：
   沙箱中 postmaster 无法收到热备就绪信号。恢复本身已验证到达目标点（postgres 日志
